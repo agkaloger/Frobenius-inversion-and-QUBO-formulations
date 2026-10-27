@@ -141,13 +141,13 @@ def Scattering_Coefficients(number,type,alpha):
       g[i]=np.array([0.5*(np.cos(2*alpha)-1),-0.5*(np.sin(2*alpha)+1)])
   return g
 
-#Returns the reduced QUBO systems
+#Returns the QUBO matrices A_R, A_I and M/A_R
 def Reduced_QUBO (R,g1,g2,k):
   ReG=Foldy_Lax_QUBO_Real(R,g1,k)
   ImG=Foldy_Lax_QUBO_Imaginary(R,g2,k)
-  Msyn=ReG+np.matmul(np.matmul(ImG,np.linalg.inv(ReG)),ImG)
+  Msyn=ReG+np.matmul(np.matmul(ImG,np.linalg.inv(ReG)),ImG)#The Schur complement, M/A_R
   return Msyn,ReG,ImG
-#Returns the reduced known vectors
+#Returns the known vectors associated to the QUBO formulation \tilde{u}_R and \tilde{u}_I
 def Reduced_QUBO_vector(X,Y,b):
   Reb=np.zeros([int(len(b)/2)])
   Imb=np.zeros([int(len(b)/2)])
