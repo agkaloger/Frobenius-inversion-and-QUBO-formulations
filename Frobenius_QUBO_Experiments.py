@@ -1,0 +1,423 @@
+!pip install dimod
+!pip install dwave-ocean-sdk
+import numpy as np
+import matplotlib
+import matplotlib.pyplot as plt
+import math
+import time
+import statistics as st
+import scipy
+import dimod
+from dwave.samplers import SimulatedAnnealingSampler
+
+#A routine computing the QUBO matrix for a given system A*x=b for a user-defined
+#radix-2 representation with N1 integer qubits and N2 fractional qubits
+def QUBO_Matrix(A,b,N1,N2):
+  N=len(b)
+  q=np.zeros([N,2*N*(N1+N2)])
+  for i in range(N):
+    for j in range(2*(N1+N2)):
+      if j<N1:
+        q[i][2*i*(N1+N2)+j]=2**(N1-1-j)
+      elif N1<=j<N1+N2:
+        q[i][2*i*(N1+N2)+j]=2**(N1-j-1)
+      elif N1+N2<=j<2*N1+N2:
+        q[i][2*i*(N1+N2)+j]=-2**(2*N1+N2-1-j)
+      else:
+        q[i][2*i*(N1+N2)+j]=-2**(2*N1+N2-j-1)
+  Ad=np.matmul(A,q)
+  M=len(q[0])
+  Ad=np.matmul(A,q)
+  QQ=np.zeros([M,M])
+  for k in range(M):
+    for n in range(M):
+        if k>n:
+            continue
+        if k==n:
+           QQ[k][n]=sum(Ad[j][n]*(Ad[j][n]-2*b[j]) for j in range(N))
+        else:
+           QQ[k][n]=2*sum(Ad[i][k]*Ad[i][n] for i in range(N))
+  return q,QQ
+
+#R=[r_1,...,r_N] is a vector containing the positions of the scatterers.
+#g=[g_1,...,g_N] is a vector containing the "strengths" associated to each scatterer.
+#k is the wavenumber of the exterior
+#The Foldy_Lax_QUBO returns the equivalent Foldy-Lax matrix used for QUBO formulations.
+def Foldy_Lax_QUBO(R,g1,g2,k):
+  #A=np.zeros([4,len(R),len(R)])
+  #G=np.zeros([len(R),len(R)])
+  A=np.zeros([2*len(R),2*len(R)])
+  ReG=np.zeros([len(R),len(R)])
+  ImG=np.zeros([len(R),len(R)])
+  for i in range(len(R)):
+    for j in range(len(R)):
+      if i==j:
+        ReG[i][j]=1
+        ImG[i][j]=0
+        #G[i][j]=1
+        A[i][j]=1
+        A[i+len(R)][j+len(R)]=-1
+      else:
+        ReG[i][j]=g1[j]*scipy.special.spherical_jn(0,k*np.linalg.norm(R[i]-R[j]),derivative=False)
+        ImG[i][j]=g2[j]*scipy.special.spherical_yn(0,k*np.linalg.norm(R[i]-R[j]),derivative=False)
+        #G[i][j]=ReG[i][j]+1j*ImG[i][j]
+        A[i][j]=ReG[i][j]
+        A[i][j+len(R)]=ImG[i][j]
+        A[i+len(R)][j]=ImG[i][j]
+        A[i+len(R)][j+len(R)]=-ReG[i][j]
+  return A
+
+def Foldy_Lax_QUBO_Real(R,g1,k):
+  ReG=np.zeros([len(R),len(R)])
+  for i in range(len(R)):
+    for j in range(len(R)):
+      if i==j:
+        ReG[i][j]=1
+      else:
+        ReG[i][j]=g1[j]*scipy.special.spherical_jn(0,k*np.linalg.norm(R[i]-R[j]),derivative=False)
+  return ReG
+
+def Foldy_Lax_QUBO_Imaginary(R,g2,k):
+  ImG=np.zeros([len(R),len(R)])
+  for i in range(len(R)):
+    for j in range(len(R)):
+      if i==j:
+        ImG[i][j]=0
+      else:
+        ImG[i][j]=g2[j]*scipy.special.spherical_yn(0,k*np.linalg.norm(R[i]-R[j]),derivative=False)
+  return ImG
+
+def QUBO_solution(A,b,N1,N2):
+  QQ=QUBO_Matrix(A,b,N1,N2)
+  q=QQ[0]
+  sampleset=SimulatedAnnealingSampler().sample_qubo(QQ[1])
+  # Extract the best sample as a standard 1D numpy array
+  best_sample = sampleset.record.sample[0]
+  u=np.zeros(len(b))
+  for i in range(len(b)):
+    u[i]=np.dot(best_sample,q[i])
+  return u
+#Computes the vector evaluating the incident field at locations r=[r_1,...,r_N].
+#k is the wavenumber of the medium.
+#type can be either 'plane' and in that case a is the vector dictating the direction of the plane wave
+#while for type 'spherical' a is the location of the point source emanating the spherical wave.
+def Incident(r,a,k,type):
+  b=np.zeros(2*len(r))
+  if type=='plane':
+    for i in range(len(r)):
+      b[i]=math.cos(k*np.dot(r[i],a))
+      b[i+len(r)]=math.sin(k*np.dot(r[i],a))
+  if type=='spherical':
+    for i in range(len(r)):
+      b[i]=scipy.special.spherical_jn(0,k*np.linalg.norm(a-r[i]),derivative=False)
+      b[i+len(r)]=scipy.special.spherical_nn(0,k*np.linalg.norm(a-r[i]),derivative=False)
+  return b
+#Creates locations. For type 'random' creates a random set of scatterers within
+#a cube of size 2*distance.
+#For type 'sphere' creates a random set of scatterers within a sphere of radius distance.
+def Scatterers(number,distance,type):
+  r=np.zeros([int(number),3])
+  if type=='random':
+    for i in range(int(number)):
+      r[i][0]=np.random.uniform(-distance,distance)
+      r[i][1]=np.random.uniform(-distance,distance)
+      r[i][2]=np.random.uniform(-distance,distance)
+  if type=='sphere':
+    for i in range(int(number)):
+      r[i][0]=distance*np.cos(2*np.pi*np.random.uniform(0,1))*np.sin(np.pi*np.random.uniform(0,1))
+      r[i][1]=distance*np.sin(2*np.pi*np.random.uniform(0,1))*np.sin(np.pi*np.random.uniform(0,1))
+      r[i][2]=distance*np.cos(np.pi*np.random.uniform(0,1))
+  return r
+#Creates a vector with the scattering coefficients for the problem.
+#If type=='random', then alpha is the maximum value of the coefficients and
+#the routine returns a real-valued vector.
+#If type=='spheres', then alpha is the electric radius k*a, with k the medium's
+#wavenumber and a the sphere's radius.
+#The routine returns a numberx2 matrix with the first column having the
+#real part and the second column having the imaginary part of the coefficients.
+def Scattering_Coefficients(number,type,alpha):
+  if type=='random':
+    g=np.zeros(int(number))
+    for i in range(int(number)):
+      g[i]=np.random.uniform(0,alpha)
+  if type=='spheres':
+    g=np.zeros([int(number),2])
+    for i in range(int(number)):
+      g[i]=np.array([0.5*(np.cos(2*alpha)-1),-0.5*(np.sin(2*alpha)+1)])
+  return g
+
+#Returns the reduced QUBO systems
+def Reduced_QUBO (R,g1,g2,k):
+  ReG=Foldy_Lax_QUBO_Real(R,g1,k)
+  ImG=Foldy_Lax_QUBO_Imaginary(R,g2,k)
+  Msyn=ReG+np.matmul(np.matmul(ImG,np.linalg.inv(ReG)),ImG)
+  return Msyn,ReG,ImG
+#Returns the reduced known vectors
+def Reduced_QUBO_vector(X,Y,b):
+  Reb=np.zeros([int(len(b)/2)])
+  Imb=np.zeros([int(len(b)/2)])
+  for i in range(int(len(b)/2)):
+    Reb[i]=b[i]
+    Imb[i]=b[i+int(len(b)/2)]
+  Rb=Reb+np.dot(np.matmul(Y,np.linalg.inv(X)),Imb)
+  Ib=np.dot(np.matmul(Y,np.linalg.inv(X)),Reb)-Imb
+  return Rb,Ib
+#Returns the QUBO solution by means of the reduced system
+#number is the number of scatterers, type1 refers to the cluster's topology
+#distance refers to the qube withing the cluster lies.
+#a refers to the source of incidence: point-source location (spherical wave incidence)
+#or direction of propagation (plane wave incidence)
+#k is the wavenumber of the medium that contains the source of incidence
+#type2 refers to the type of incidence (plane or spherical)
+#R refers to the radius of the spheres composing the cluster or the interval which the random stregnths are assigned
+#type3 refers to the type of the assigned strengths: random, energy-related, volume-related, etc
+#N1 refers to the number of integer qubits, N2 refers to the number of fractional qubits
+#Returns: the quantum-obtained solution, the exact solution, the error between the quantum and the classical solution
+#the locations of the scatterers and the vector containing the evaluations of the incident field on the scatterers' locations.
+def Quantum_Foldy_Lax_solution(number,distance,type1,a,k,type2,R,type3,N1,N2):
+  r=Scatterers(number,distance,type1)
+  b=Incident(r,a,k,type2)
+  g1=np.transpose(Scattering_Coefficients(len(b),type3,k*R))[0]
+  g2=np.transpose(Scattering_Coefficients(len(b),type3,k*R))[1]
+  A=Foldy_Lax_QUBO(r,g1,g2,k)
+  Msyn=Reduced_QUBO(r,g1,g2,k)[0]
+  ReG=Reduced_QUBO(r,g1,g2,k)[1]
+  ImG=Reduced_QUBO(r,g1,g2,k)[2]
+  Rb=Reduced_QUBO_vector(ReG,ImG,b)[0]
+  Ib=Reduced_QUBO_vector(ReG,ImG,b)[1]
+  Rex=QUBO_solution(Msyn,Rb,N1,N2)
+  Imx=QUBO_solution(Msyn,Ib,N1,N2)
+  x=np.linalg.solve(A,b)
+  return np.array([Rex[i]+1j*Imx[i] for i in range(len(Rex))]), np.array([x[i]+1j*x[i+int(len(x)/2)] for i in range(int(len(x)/2))]), np.array([abs(Rex[i]-x[i])+abs(Imx[i]-x[i+int(len(x)/2)]) for i in range(int(len(x)/2))]), np.array([abs(Rex[i]-x[i]) for i in range(int(len(x)/2))]),np.array([abs(Imx[i]-x[i+int(len(x)/2)]) for i in range(int(len(x)/2))]),r,b
+#==========================INPUTS AND DATA STRUCTURES==========================#
+
+k=1.5#Eletric radius k_0a
+a=np.array([-np.sqrt(3)/2,0,1/2])#Plane wave excitation
+solsa=np.zeros([10,100])#Figs1-2
+solsb=np.zeros([10,100])#Figs1-2
+avgRe=np.zeros(10)#Figs1-2
+avgIm=np.zeros(10)#Figs1-2
+bestRe=np.zeros(10)#Figs1-2
+bestIm=np.zeros(10)#Figs1-2
+Re18=np.zeros(100)#Fig 3
+Im18=np.zeros(100)#Fig 3
+sols1=np.zeros([5,100])#Fig 4
+mins1=np.zeros([9])#Fig 4
+sols2=np.zeros([8,100])#Fig 4
+mins2=np.zeros([9])#Fig 4
+sols3=np.zeros([10,100])#Fig 4
+mins3=np.zeros([9])#Fig 4
+mins4=np.zeros([4,10])#Fig 5
+sols4=np.zeros([10,100*3])#Fig 5
+avg10=np.zeros(100)#Fig 6
+avg13=np.zeros(100)#Fig 6
+avg16=np.zeros(100)#Fig 6
+avg18=np.zeros(100)#Fig 7
+min18=np.zeros(100)#Fig 7
+max18=np.zeros(100)#Fig 7
+mins8=np.zeros([10,6])#Fig 8
+sols9=np.zeros([5,100])#Fig 9
+perc9A=np.zeros([5,100])#Fig 9
+perc9B=np.zeros([5,100])#Fig 9
+percsA=np.zeros([7,5])#Fig 9
+percsB=np.zeros([7,5])#Fig 9
+variables=["$u_1$","$u_2$","$u_3$","$u_4$","$u_5$","$u_6$","$u_7$","$u_8$","$u_9$","$u_{10}$"]#Figs 1-2-3-5
+qubits=np.array([10+m for m in range(1,9)])#Fig 4
+simulations=np.linspace(1,100,100)#Figs 6-7
+iters=np.array([50*k for k in range(1,7)])#Fig 8
+qubitses=np.array([10+m for m in range(2,9)])#Fig 9
+
+#===============================FIGURES 1,2 AND 3===============================#
+
+for j in range(100):
+  SolutionRe=Quantum_Foldy_Lax_solution(10,2,'random',a,k,'plane',0.001,'spheres',1,18)[3]
+  SolutionIm=Quantum_Foldy_Lax_solution(10,2,'random',a,k,'plane',0.001,'spheres',1,18)[4]
+  for i in range(10):
+    solsa[i][j]=SolutionRe[i]
+    solsb[i][j]=SolutionIm[i]
+    avgRe[i]=-np.log10(np.average((solsa)[i]))
+    avgIm[i]=-np.log10(np.average((solsb)[i]))
+    bestRe[i]=-np.log10(np.min((solsa)[i]))
+    bestIm[i]=-np.log10(np.min((solsb)[i]))
+    Re18[j]=-np.log10(np.average(SolutionRe))
+    Im18[j]=-np.log10(np.average(SolutionIm))
+
+#Figure 1
+plt.scatter(variables,avgRe,color='b',label='real part')
+plt.scatter(variables,avgIm,color='r',label='imaginary part')
+plt.xlabel('Scattered fields',fontsize='18')
+plt.ylabel('Order of Precision',fontsize='18')
+plt.xticks(fontsize='15')
+plt.yticks(fontsize='15')
+plt.legend(loc='best', ncols=2, fontsize='14')
+plt.grid()
+plt.show()
+
+#Figure 2
+plt.scatter(variables,bestRe,color='b',label='real part')
+plt.scatter(variables,bestIm,color='r',label='imaginary part')
+plt.xlabel('Scattered fields',fontsize='18')
+plt.ylabel('Order of Precision',fontsize='18')
+plt.xticks(fontsize='15')
+plt.yticks(fontsize='15')
+plt.legend(loc='best', ncols=2, fontsize='14')
+plt.grid()
+plt.show()
+
+#Figure 3
+plt.scatter(simulations,Re18,color='b',label='real part')
+plt.scatter(simulations,Im18,color='r',label='imaginary part')
+plt.xlabel('Simulations',fontsize='18')
+plt.ylabel('Order of Precision',fontsize='18')
+plt.xticks(fontsize='15')
+plt.yticks(fontsize='15')
+plt.legend(loc='best', ncols=2, fontsize='14')
+plt.grid()
+plt.show()
+
+#================================FIGURES 4 AND 5================================#
+
+#Figure 4
+for m in range(1,9):
+  for j in range(100):
+    Solution1=Quantum_Foldy_Lax_solution(5,2,'random',a,k,'plane',0.001,'spheres',1,10+m)[2]
+    Solution2=Quantum_Foldy_Lax_solution(8,2,'random',a,k,'plane',0.001,'spheres',1,10+m)[2]
+    Solution3=Quantum_Foldy_Lax_solution(10,2,'random',a,k,'plane',0.001,'spheres',1,10+m)[2]
+    for i in range(5):
+      sols1[i][j]=Solution1[i]
+    for ii in range(8):
+      sols2[ii][j]=Solution2[ii]
+    for iii in range(10):
+      sols3[iii][j]=Solution3[iii]
+  mins1[m-1]=-np.log10(np.min(sols1))
+  mins2[m-1]=-np.log10(np.min(sols2))
+  mins3[m-1]=-np.log10(np.min(sols3))
+plt.scatter(qubits,mins1,color='b',label='5 scatterers',marker="o")
+plt.scatter(qubits,mins2,color='r',label='8 scatterers',marker="x")
+plt.scatter(qubits,mins3,color='orange',label='10 scatterers',marker="*")
+plt.xlabel('Fractional qubits',fontsize='18')
+plt.ylabel('Order of Precision',fontsize='18')
+plt.xticks(fontsize='15')
+plt.yticks(fontsize='15')
+plt.legend(loc='best', ncols=2, fontsize='14')
+plt.grid()
+plt.show()
+
+#Figure 5
+for n in range(3,7):  
+  r=int(3*n+1+(n-1)//3) 
+  for j in range(100):
+    Solution1=Quantum_Foldy_Lax_solution(10,2,'random',a,k,'plane',0.001,'spheres',1,r)[2]
+    for i in range(10):
+      sols4[i][j]=Solution1[i]
+      mins4[n-3][i]=-np.log10(np.min(sols4[i,:j+1]))
+plt.scatter(variables,mins4[0],label='$n=3$')
+plt.scatter(variables,mins4[1],label='$n=4$')
+plt.scatter(variables,mins4[2],label='$n=5$')
+plt.scatter(variables,mins4[3],label='$n=6$')
+plt.xlabel('Scattered field',fontsize='18')
+plt.ylabel('Order of Precision',fontsize='18')
+plt.xticks(fontsize='15')
+plt.yticks(fontsize='15')
+plt.legend(loc='best', ncols=2, fontsize='14')
+plt.grid()
+plt.show()
+
+#================================FIGURES 6 AND 7================================#
+
+for j in range(100):
+  Solution10=Quantum_Foldy_Lax_solution(10,2,'random',a,k,'plane',0.001,'spheres',1,10)[2]#Fig 6
+  Solution13=Quantum_Foldy_Lax_solution(10,2,'random',a,k,'plane',0.001,'spheres',1,13)[2]#Fig 6
+  Solution16=Quantum_Foldy_Lax_solution(10,2,'random',a,k,'plane',0.001,'spheres',1,16)[2]#Fig 6
+  Solution18=Quantum_Foldy_Lax_solution(10,2,'random',a,k,'plane',0.001,'spheres',1,18)[2]#Fig 6
+  avg10[j]=-np.log10(np.average(Solution10))
+  avg13[j]=-np.log10(np.average(Solution13))
+  avg16[j]=-np.log10(np.average(Solution16))
+  avg18[j]=-np.log10(np.average(Solution18))
+  min18[j]=-np.log10(np.min(Solution18))
+  max18[j]=-np.log10(np.max(Solution18))
+
+#Figure 6
+plt.scatter(simulations,avg10,color='b',label='10 qubits')
+plt.scatter(simulations,avg13,color='r',label='13 qubits')
+plt.scatter(simulations,avg16,color='orange',label='16 qubits')
+plt.xlabel('Simulations',fontsize='18')
+plt.ylabel('Order of Precision',fontsize='18')
+plt.xticks(fontsize='15')
+plt.yticks(fontsize='15')
+plt.legend(loc='best', ncols=2, fontsize='14')
+plt.grid()
+plt.show()
+
+#Figure 7
+plt.scatter(simulations,min18,color='b',label='min')
+plt.scatter(simulations,max18,color='r',label='max')
+plt.scatter(simulations,avg18,color='orange',label='avg')
+plt.xlabel('Simulations',fontsize='18')
+plt.ylabel('Order of Precision',fontsize='18')
+plt.xticks(fontsize='15')
+plt.yticks(fontsize='15')
+plt.legend(loc='best', ncols=2, fontsize='14')
+plt.grid()
+plt.show()
+
+#================================FIGURES 8 AND 9================================#
+
+#Figure 8
+for k_val in range(1,7):
+  sols=np.zeros([50*k_val,10])
+  for j in range(50*k_val):
+    Solution1=Quantum_Foldy_Lax_solution(10,2,'random',a,k,'plane',0.001,'spheres',1,20)[2]
+    for i in range(10):
+      sols[j][i]=Solution1[i]
+  for i in range(10):
+    mins8[i][k_val-1]=-np.log10(np.min(sols[:, i]))
+plt.scatter(iters,mins8[0],label='$u_1$')
+plt.scatter(iters,mins8[1],label='$u_2$')
+plt.scatter(iters,mins8[2],label='$u_3$')
+plt.scatter(iters,mins8[3],label='$u_4$')
+plt.scatter(iters,mins8[4],label='$u_5$')
+plt.scatter(iters,mins8[5],label='$u_6$')
+plt.scatter(iters,mins8[6],label='$u_7$')
+plt.scatter(iters,mins8[7],label='$u_8$')
+plt.scatter(iters,mins8[8],label='$u_9$')
+plt.scatter(iters,mins8[9],label='$u_{10}$')
+plt.xlabel('Iterations',fontsize='18')
+plt.ylabel('Order of Precision',fontsize='18')
+plt.xticks(fontsize='15')
+plt.yticks(fontsize='15')
+plt.legend(loc='best', ncols=2, fontsize='14')
+plt.grid()
+plt.show()
+
+#Figure 9
+for m in range(2,9):
+  for j in range(100):
+    Solution9=Quantum_Foldy_Lax_solution(5,2,'random',a,k,'plane',0.001,'spheres',1,10+m)[2]
+    for i in range(5):
+      sols9[i][j]=Solution9[i]
+      if sols9[i][j]<5*10**(-4):
+        perc9A[i][j]=1
+      if sols9[i][j]<2.5*10**(-4):
+        perc9B[i][j]=1
+      else:
+        continue
+      percsA[m-2][i]=np.average(perc9A[i])
+      percsB[m-2][i]=np.average(perc9B[i])
+plt.scatter(qubitses,np.transpose(percsA)[0],color='b',label='u_1, 0.0005')
+plt.scatter(qubitses,np.transpose(percsB)[0],color='b',marker='*',label='u_1, 0.00025')
+plt.scatter(qubitses,np.transpose(percsA)[1],color='r',label='u_2, 0.0005')
+plt.scatter(qubitses,np.transpose(percsB)[1],color='r',marker='*',label='u_2, 0.00025')
+plt.scatter(qubitses,np.transpose(percsA)[2],color='cyan',label='u_3, 0.0005')
+plt.scatter(qubitses,np.transpose(percsB)[2],color='cyan',marker='*',label='u_3, 0.00025')
+plt.scatter(qubitses,np.transpose(percsA)[3],color='purple',label='u_4, 0.0005')
+plt.scatter(qubitses,np.transpose(percsB)[3],color='purple',marker='*',label='u_4, 0.00025')
+plt.scatter(qubitses,np.transpose(percsA)[4],color='orange',label='u_5, 0.0005')
+plt.scatter(qubitses,np.transpose(percsB)[4],color='orange',marker='*',label='u_5, 0.00025')
+plt.xlabel('Fractional qubits',fontsize='18')
+plt.ylabel('Below treshold ratio',fontsize='18')
+plt.xticks(fontsize='15')
+plt.yticks(fontsize='15')
+plt.legend(loc='best', ncols=2, fontsize='14')
+plt.grid()
+plt.show()
